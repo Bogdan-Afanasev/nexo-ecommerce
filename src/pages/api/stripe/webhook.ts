@@ -1,0 +1,123 @@
+import { buffer } from "micro";
+import type { NextApiRequest, NextApiResponse } from "next";
+import Stripe from "stripe";
+import prisma from "@/lib/prisma";
+import { createClient } from "next-sanity";
+import { umamiTrackCheckoutSuccessEvent } from "@/lib/umami";
+
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-02-24.acacia",
+});
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).end("Method Not Allowed");
+  }
+
+  const sig = req.headers["stripe-signature"];
+  if (!sig) {
+    return res.status(400).json({ error: "Missing stripe-signature header" });
+  }
+
+  const sanityClient = createClient({
+    projectId: process.env.NEXT_PUBLIC_SANITY_PROJECT_ID,
+    dataset: process.env.NEXT_PUBLIC_SANITY_DATASET,
+    apiVersion: process.env.NEXT_PUBLIC_SANITY_API_VERSION,
+    token: process.env.SANITY_API_WRITE_TOKEN,
+  });
+
+  let event: Stripe.Event;
+
+  try {
+    const buf = await buffer(req);
+    event = stripe.webhooks.constructEvent(
+      buf,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET!
+    );
+  } catch (err) {
+    console.error("❌ Error verifying webhook:", err);
+    return res.status(400).json({ error: "Webhook Error" });
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object as Stripe.Checkout.Session;
+    const cartId = session.metadata?.cartId;
+    const userId = session.metadata?.userId;
+
+    try {
+      if (!cartId) throw new Error("Missing cart ID");
+      const cart = await prisma.cart.findUnique({
+        where: { id: cartId },
+        include: { items: true },
+      });
+      if (!cart) throw new Error("Cart not found");
+
+      const order = await sanityClient.create({
+        _type: "order",
+        orderNumber: session.id.slice(-8).toUpperCase(),
+        orderDate: new Date().toISOString(),
+        customerId: userId !== "-" ? userId : undefined,
+        customerEmail: session.customer_details?.email,
+        customerName: session.customer_details?.name,
+        stripeCustomerId:
+          typeof session.customer === "object"
+            ? session.customer?.id || ""
+            : session.customer,
+        stripeCheckoutSessionId: session.id,
+        stripePaymentIntentId: session.payment_intent as string,
+        totalPrice: Number(session.amount_total) / 100,
+        shippingAddress: {
+          _type: "shippingAddress",
+          name: session.shipping_details?.name,
+          line1: session.shipping_details?.address?.line1,
+          line2: session.shipping_details?.address?.line2,
+          city: session.shipping_details?.address?.city,
+          state: session.shipping_details?.address?.state,
+          postalCode: session.shipping_details?.address?.postal_code,
+          country: session.shipping_details?.address?.country,
+        },
+        orderItems: cart.items.map((item) => ({
+          _type: "orderItem",
+          _key: item.id,
+          product: {
+            _type: "reference",
+            _ref: item.sanityProductId,
+          },
+          quantity: item.quantity,
+          price: item.price,
+        })),
+        status: "PROCESSING",
+      });
+
+      try {
+        await umamiTrackCheckoutSuccessEvent({
+          cartId: cartId,
+          email: order.customerEmail || "-",
+          orderId: order.orderNumber,
+          orderTotal: order.totalPrice,
+          orderCurrency: "RUB",
+        });
+      } catch (e) {
+        console.error("Umami tracking error:", e);
+      }
+
+      await prisma.cart.delete({ where: { id: cartId } });
+    } catch (e) {
+      console.error("❌ Error during order creation:", e);
+      return res.status(500).json({ error: "Order creation failed" });
+    }
+  }
+
+  return res.status(200).json({ received: true });
+}
